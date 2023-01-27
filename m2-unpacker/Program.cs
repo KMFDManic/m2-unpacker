@@ -1,42 +1,80 @@
-﻿using GMWare.M2.MArchive;
-using System;
-using System.Collections.Generic;
+﻿using System;
 using System.IO;
-using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
-using System.Threading.Tasks;
+using GMWare.M2.MArchive;
 
 namespace m2_unpacker
 {
     internal class Program
     {
-        internal enum KeyTypes { SegaGenesisMini }
-
-        internal class AllDataFile
+        static string findKey(byte[] data)
         {
-            public byte[] KeyHash { get; set; }
-
-            public int KeyLength { get; set; }
-            public Func<IMArchiveCodec> CodecConstructor { get; set; }
+            uint[] p = new uint[8];
+            uint pi = 0;
+            for (uint i = 3; i < data.Length; i += 4)
+            {
+                if ((data[i]==0)&&(data[i+1]!=0))
+                {
+                    if ((i-p[pi])==0x18)
+                    {
+                        uint chsm = 0;
+                        for (uint j = 1; j < 4; ++j)
+                            chsm = chsm*2 + data[p[pi]+j];
+                        if (chsm==0x331)
+                        {
+                            for (int j = 4; j < 0x18; ++j)
+                                chsm = chsm*2 + data[p[pi]+j];
+                            if (chsm==0x39ba8fcc)
+                            {
+                                string key = null;
+                                for (int j = 6; j > 0; --j)
+                                {
+                                    int s = (int)p[(pi+j+0)&7];
+                                    int e = (int)p[(pi+j+1)&7];
+                                    while (data[e]==0)
+                                        --e;
+                                    key = Encoding.ASCII.GetString(data, s+1, e-s);
+                                    if (key.IndexOf("data")<0)
+                                        return key;
+                                }
+                                return null;
+                            }
+                        }
+                    }
+                    pi = (pi+1)&7;
+                    p[pi] = i;
+                }
+            }
+            return null;
         }
 
-        public static readonly IReadOnlyDictionary<KeyTypes, AllDataFile> knownFiles = new Dictionary<KeyTypes, AllDataFile>()
+        static string findBinary(string path)
         {
+	            if (path.Substring(path.Length - 4) == ".exe")
+                return path;
+
+            path = Path.GetDirectoryName(path);
+            string[] dirs = {path, Path.Combine(path, "..")};
+            string[] names = {"m2engage", "game", "NMA1", "NMA2"};
+            string[] ext = {"", ".exe"};
+
+            for (uint i = 0; i < dirs.Length; ++i)		
             {
-                KeyTypes.SegaGenesisMini, new AllDataFile()
+                for (uint j = 0; j < names.Length; ++j)
                 {
-                    KeyHash = new byte[] { 0xC7, 0x54, 0xF9, 0x22, 0x59, 0x6D, 0xDB, 0x68, 0x0A, 0x9D, 0xA4, 0xB2, 0xA0, 0x28, 0x03, 0x38 },
-                    KeyLength = 64,
-                    CodecConstructor = () =>
+                    string name = Path.Combine(dirs[i], names[j]);
+                    for (uint k = 0; k < ext.Length; ++k)
                     {
-                        return new ZStandardCodec();
+                        string res = name + ext[k];
+                        if (File.Exists(res))
+                            return res;
                     }
                 }
             }
-        };
+            return Path.Combine(dirs[0], names[0]);
+        }
 
-        static int Main(string[] args)
+        static int notMain(string[] args)
         {
             if (args.Length == 0)
             {
@@ -52,7 +90,7 @@ namespace m2_unpacker
 
             string alldataPath = Path.Combine(Path.GetDirectoryName(args[0]), "alldata.bin");
             string alldataPsbPath = Path.Combine(Path.GetDirectoryName(args[0]), "alldata.psb.m");
-            string m2Path = Path.Combine(Path.GetDirectoryName(args[0]), "m2engage");
+            string m2Path = findBinary(args[0]);
 
             if (!File.Exists(alldataPath))
             {
@@ -72,43 +110,46 @@ namespace m2_unpacker
                 return 5;
             }
 
-            byte[] alldataKey = new byte[13];
-
-            using (var m2Stream = new MemoryStream())
-            using (var m2FileStream = File.OpenRead(m2Path))
+            string key = findKey(File.ReadAllBytes(m2Path));
+            if (key==null)
             {
-                m2FileStream.CopyTo(m2Stream);
+                Console.WriteLine("m2engage key not found.");
+                return 6;
+            }
 
-                using (MD5 md5Hasher = MD5.Create())
-                {
-                    m2Stream.Seek(0, SeekOrigin.Begin);
+            Console.WriteLine(Console.Title = $"m2engage key found: {key}");
 
-                    for (int i = 0; i < m2Stream.Length - alldataKey.Length; i += 4)
-                    {
-                        m2Stream.Seek(i, SeekOrigin.Begin);
-                        m2Stream.Read(alldataKey, 0, alldataKey.Length);
+            string type = Encoding.ASCII.GetString(File.ReadAllBytes(alldataPsbPath), 0, 3);
+            IMArchiveCodec codec = null;
+            if (type=="mdf")
+                codec = new ZlibCodec();
+            if (type=="mfl")
+                codec = new FastLzCodec();
+            if (type=="mzs")
+                codec = new ZStandardCodec();
 
-                        foreach (var knownFile in knownFiles)
-                        {
-                            if (md5Hasher.ComputeHash(alldataKey).SequenceEqual(knownFile.Value.KeyHash))
-                            {
-                                Console.WriteLine(Console.Title = $"{knownFile.Key.ToString()} Key found: {Encoding.ASCII.GetString(alldataKey)}");
-                                var unpackedPath = Path.Combine(Path.GetDirectoryName(args[0]), "Unpacked alldata.bin");
-                                Directory.CreateDirectory(unpackedPath);
-
-                                var packer = new MArchivePacker(knownFile.Value.CodecConstructor(), Encoding.ASCII.GetString(alldataKey), knownFile.Value.KeyLength);
-                                AllDataPacker.UnpackFiles(alldataPsbPath, unpackedPath, packer);
-                                packer.DecompressDirectory(unpackedPath);
-                                return 0;
-                            }
-                        }
-                    }
-                }
-
-                Console.WriteLine("Key not found.");
-                Console.Read();
-                return 255;
+            if (codec==null)
+            {
+                Console.WriteLine($"Unknown compression: {type}");
+                return 7;
             }
         }
     }
+
+            var unpackedPath = Path.Combine(Path.GetDirectoryName(args[0]), "Unpacked alldata.bin");
+            Directory.CreateDirectory(unpackedPath);
+
+            var packer = new MArchivePacker(codec, key, 64);
+            AllDataPacker.UnpackFiles(alldataPsbPath, unpackedPath, packer);
+            packer.DecompressDirectory(unpackedPath);
+            Console.WriteLine("");
+            Console.WriteLine("done!");
+            return 0;
+        }
+
+        static int Main(string[] args)
+        {
+            int res = notMain(args);
+            Console.Read();
+            return res;
 }
